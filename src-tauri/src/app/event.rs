@@ -1,4 +1,5 @@
 use std::{sync::Mutex, thread};
+use std::sync::mpsc;
 
 use rdev::{listen, Button, EventType};
 use serde::Serialize;
@@ -33,35 +34,32 @@ pub fn map_mouse_button(button: Button) -> MouseButton {
 }
 
 pub fn start_listener(app_handle: AppHandle, toggle_menu_item: MenuItem<Wry>) {
-    thread::spawn(move || {
-        println!("Starting global input listener...");
+    // Canal para enviar eventos desde el hook (debe ser rápido) al hilo procesador
+    let (tx, rx) = mpsc::channel::<rdev::Event>();
 
-        if let Err(err) = listen(move |event| {
-            // get app state
-            let state = app_handle.state::<Mutex<AppState>>();
+    // Hilo procesador: aquí va toda la lógica pesada (Mutex, emit, etc.)
+    let app_handle_processor = app_handle.clone();
+    thread::spawn(move || {
+        for event in rx {
+            let state = app_handle_processor.state::<Mutex<AppState>>();
             let mut app_state = state.lock().unwrap();
 
             // track pressed keys
             if let EventType::KeyPress(key) = event.event_type {
                 let key_name = format!("{:?}", key);
-                // If the name contains parenthesis (like "RawKey(123)", "Unknown()"), ignore it.
                 if key_name.contains('(') {
-                    return;
+                    continue;
                 }
-                // if key is already marked as pressed, ignore repeat
                 if app_state.pressed_keys.contains(&key_name) {
-                    return;
+                    continue;
                 }
-                // record key as pressed
                 app_state.pressed_keys.push(key_name);
-                // check if toggle shortcut is pressed
                 if app_state.toggle_shortcut == app_state.pressed_keys {
-                    app_state.toggle_listener(&app_handle, &toggle_menu_item);
+                    app_state.toggle_listener(&app_handle_processor, &toggle_menu_item);
 
                     if !app_state.listening {
-                        // emit key releases for all pressed keys
                         for key_name in &app_state.pressed_keys {
-                            app_handle
+                            app_handle_processor
                                 .emit_to(
                                     "main",
                                     "input-event",
@@ -77,16 +75,15 @@ pub fn start_listener(app_handle: AppHandle, toggle_menu_item: MenuItem<Wry>) {
             } else if let EventType::KeyRelease(key) = event.event_type {
                 let key_name = format!("{:?}", key);
                 if key_name.contains('(') {
-                    return;
+                    continue;
                 }
-                // remove key from pressed keys
                 app_state.pressed_keys.retain(|k| k != &key_name);
             }
 
-            // emit event if listening
             if !app_state.listening {
-                return;
+                continue;
             }
+
             let input_event = match event.event_type {
                 EventType::KeyPress(key) => Some(InputEvent::KeyEvent {
                     pressed: true,
@@ -105,7 +102,6 @@ pub fn start_listener(app_handle: AppHandle, toggle_menu_item: MenuItem<Wry>) {
                     pressed: false,
                 }),
                 EventType::MouseMove { x, y } => {
-                    // Convert Physical -> Logical
                     #[cfg(target_os = "macos")]
                     let (logical_x, logical_y) = (
                         x - app_state.monitor_position.0 as f64,
@@ -128,7 +124,15 @@ pub fn start_listener(app_handle: AppHandle, toggle_menu_item: MenuItem<Wry>) {
                 }
             };
 
-            app_handle.emit("input-event", input_event).unwrap();
+            app_handle_processor.emit("input-event", input_event).unwrap();
+        }
+    });
+
+    // Hilo del hook: solo reenvía el evento por el canal y retorna inmediatamente
+    thread::spawn(move || {
+        println!("Starting global input listener...");
+        if let Err(err) = listen(move |event| {
+            let _ = tx.send(event);
         }) {
             eprintln!("rdev listen failed: {:?}", err);
         }
